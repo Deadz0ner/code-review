@@ -1,0 +1,11 @@
+pydantic>=2.6
+pydantic-ai>=0.0.50
+python-dotenv>=1.0
+openai>=1.40
+groq>=0.11
+anthropic>=0.34
+google-generativeai>=0.7
+ollama>=0.3
+pylint>=3.0
+bandit>=1.7
+radon>=6.0
