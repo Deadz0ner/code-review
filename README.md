@@ -4,45 +4,7 @@ An agentic CLI code reviewer for Python projects. It builds a hash-keyed cache o
 
 Built with **PydanticAI** for the agent loop and structured output. Configured for **Groq's free tier** out of the box; also supports Anthropic, OpenAI, Gemini, and Ollama.
 
----
-
-## Architecture
-
-```
-                          ┌──────────────────────────────────────┐
-                          │  Layer 1 — Cache                     │
-   .py files ───────────► │  ast parser → cheap-LLM summarizer   │
-                          │  → .review_cache.json (hash-keyed)   │
-                          └──────────────────┬───────────────────┘
-                                             │ compressed code map
-                                             ▼
-                          ┌──────────────────────────────────────┐
-                          │  Layer 2 — Static analysis (parallel)│
-                          │  pylint  ◇  bandit  ◇  radon         │
-                          └──────────────────┬───────────────────┘
-                                             │ findings
-                                             ▼
-                          ┌──────────────────────────────────────┐
-                          │  Layer 3 — Agentic loop (PydanticAI) │
-                          │  reviewer LLM drives investigation   │
-                          │  via 5 tools:                        │
-                          │    get_file, get_lines, get_imports, │
-                          │    get_callers, list_files           │
-                          └──────────────────┬───────────────────┘
-                                             │ ReviewReport
-                                             ▼
-                          ┌──────────────────────────────────────┐
-                          │  Layer 4 — Output                    │
-                          │  Pydantic validation → CLI report    │
-                          └──────────────────────────────────────┘
-```
-
-Two LLM roles, configured independently:
-
-| Role | Used for | Default (Groq) |
-|---|---|---|
-| `SUMMARIZER_MODEL` | One-shot descriptions for undocumented files/functions | `llama-3.1-8b-instant` |
-| `REVIEWER_MODEL` | The agentic loop with tool use and structured output | `groq:llama-3.3-70b-versatile` |
+> Want to understand the project deeply? Read [docs/](docs/) — nine short, focused files cover architecture, each layer, scope, and known issues.
 
 ---
 
@@ -50,45 +12,37 @@ Two LLM roles, configured independently:
 
 ```bash
 cd code-review-agent-v2
-python -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate          # NOTE: source it, do NOT execute it
 pip install -r requirements.txt
 ```
 
-### Configure a provider (pick one)
-
-The agent auto-detects whichever of these env vars you set first. **Groq is recommended** — it's free and fast.
+### Configure a provider
 
 ```bash
-# Groq (recommended, free)
-export GROQ_API_KEY=gsk_...
-
-# OR Anthropic
-export ANTHROPIC_API_KEY=sk-ant-...
-
-# OR OpenAI
-export OPENAI_API_KEY=sk-...
-
-# OR Gemini
-export GEMINI_API_KEY=...
-
-# OR Ollama (local)
-export OLLAMA_HOST=http://localhost:11434
+cp .env.example .env
+# edit .env, paste your key (Groq is free)
 ```
 
-### Override the auto-picked models (optional)
+`.env` is gitignored. The agent auto-detects whichever of these env vars is set first:
+
+```
+GROQ_API_KEY  >  ANTHROPIC_API_KEY  >  OPENAI_API_KEY  >  GEMINI_API_KEY  >  OLLAMA_HOST
+```
+
+To override the auto-picked model:
 
 ```bash
-# Reviewer model uses PydanticAI's <provider>:<model> string
-export REVIEWER_MODEL=groq:llama-3.3-70b-versatile
-export REVIEWER_MODEL=anthropic:claude-sonnet-4-20250514
-export REVIEWER_MODEL=openai:gpt-4o
-export REVIEWER_MODEL=google-gla:gemini-1.5-pro
+# in .env
+REVIEWER_MODEL=groq:llama-3.3-70b-versatile      # default for Groq
+REVIEWER_MODEL=anthropic:claude-sonnet-4-20250514
+REVIEWER_MODEL=openai:gpt-4o
+REVIEWER_MODEL=google-gla:gemini-1.5-pro
 
-# Summarizer model is just a model name (uses an OpenAI-compatible client)
-export SUMMARIZER_MODEL=llama-3.1-8b-instant       # Groq
-export SUMMARIZER_MODEL=gpt-4o-mini                # OpenAI
-export SUMMARIZER_MODEL=gemini-1.5-flash           # Gemini
-export SUMMARIZER_MODEL=llama3                     # Ollama
+SUMMARIZER_MODEL=llama-3.1-8b-instant            # default for Groq
+SUMMARIZER_MODEL=gpt-4o-mini
+SUMMARIZER_MODEL=gemini-1.5-flash
+SUMMARIZER_MODEL=llama3
 ```
 
 ---
@@ -108,10 +62,10 @@ How do you want to provide code for review?
   [3] Folder path
 
 Choice [1/2/3]: 3
-Path to folder: examples/buggy_app
+Path to folder: examples/task_runner
 ```
 
-Then watch each layer run, ending in a printed report.
+Then watch each layer run live and end on a formatted report.
 
 ### Demo targets
 
@@ -119,79 +73,42 @@ Two example projects ship with the tool:
 
 | Target | What it shows |
 |---|---|
-| `examples/buggy_app/` | Compact 3-file example. SQL injection traced one hop from `auth.py` back to `api/routes.py:handle_login`. Good for a fast demo. |
-| `examples/task_runner/` | Larger 8-file example. Showcases a **3-hop root-cause trace** (CLI argv → `scheduler.dispatch` → `storage.get_task_by_name`) plus issues the static tools miss: timing-attack token compare, path traversal, user-controlled `rm -rf`, TOCTOU window, default-secret fallback, and a bare `except` that swallows errors. The agent has to actually investigate to surface these — that's the point. |
+| [examples/buggy_app/](examples/buggy_app/) | Compact 3-file example. One-hop trace: SQL injection in `auth.py` → `handle_login` in `api/routes.py`. Fast demo (~30s). |
+| [examples/task_runner/](examples/task_runner/) | Larger 8-file example. **3-hop trace** (CLI argv → `scheduler.dispatch` → `storage.get_task_by_name`) plus issues the static tools miss: timing-attack token compare, path traversal, user-controlled `rm -rf`, TOCTOU window, default secret. Best for video. |
 
 ---
 
-## How the cache works
-
-On first run, the cache layer:
-
-1. Walks the project for every `.py` file (skipping `venv/`, `.git/`, `__pycache__/`, `dist/`, `build/`, etc.).
-2. SHA-256 hashes each file.
-3. AST-parses each file to extract module/class/function signatures, docstrings, and a `documented` flag.
-4. Calls the cheap summarizer **only** for items with no docstring — never for already-documented code.
-5. Writes everything to `.review_cache.json` in the project root.
-
-On subsequent runs:
-
-- For each file, current hash is compared to the cached hash.
-- **Match** → entry is reused; no parsing, no summarizer call.
-- **Hash changed or new file** → that one file is re-parsed and re-summarized.
-- **File deleted** → its entry is dropped.
-
-The cache file lives **inside the project being reviewed** (not in this tool's directory), so each project gets its own cache.
-
----
-
-## Example output (with root-cause tracing)
+## Architecture at a glance
 
 ```
-============================================================
-CODE REVIEW REPORT
-============================================================
-Files reviewed: 3  |  Agent steps: 6
-Critical: 1  |  High: 1  |  Medium: 2  |  Low: 1
-
-SUMMARY:
-The buggy_app contains a critical SQL injection in auth.login that flows
-from unsanitized request input via api/routes.py:handle_login. The auth
-layer also uses MD5 for password hashing — broken for password storage.
-handle_request has very high cyclomatic complexity and should be split
-by HTTP method.
-
-ISSUES:
-
-[CRITICAL] security | auth.py:11
-  String-concatenated SQL query allows arbitrary SQL injection via the
-  `username` parameter.
-  Root cause: input flows from api/routes.py:10 (handle_login) directly
-  into login() without any sanitization or parameterization.
-  Fix: use parameterized queries: cur.execute("SELECT id, password_hash
-  FROM users WHERE username = ?", (username,))
-  Related: api/routes.py
-
-[HIGH] security | auth.py:23
-  MD5 is unsuitable for password hashing — fast and cryptographically
-  broken.
-  Fix: replace with bcrypt or argon2 via the `passlib` or `argon2-cffi`
-  package, and migrate stored hashes on next login.
-
-[MEDIUM] complexity | api/routes.py:16
-  handle_request has cyclomatic complexity 14 (rank D).
-  Fix: split by HTTP method into _handle_get / _handle_post / _handle_delete.
-...
+.py files → cache (ast + cheap-LLM summaries, hash-keyed)
+          → pylint + bandit + radon (parallel subprocesses)
+          → reviewer LLM with 5 tools (PydanticAI agent loop)
+          → Pydantic-validated ReviewReport → CLI
 ```
 
-The `Root cause` line is the agentic part — pylint and bandit flag the symptom inside `auth.py`, but the agent traced it back through `get_callers("login")` to `api/routes.py:handle_login` and reported the originating file as `related`.
+The five tools the agent drives: `get_file`, `get_lines`, `get_imports`, `get_callers`, `list_files`. See [docs/05-agent-loop.md](docs/05-agent-loop.md).
 
 ---
 
-## Limitations
+## Documentation
 
-- **Python only.** The cache layer parses with `ast`, so non-Python files in the project are ignored.
-- **LLM-suggested fixes should be reviewed before applying.** The agent reads file slices, not the live runtime — it can be wrong. Treat the report like a senior reviewer's notes, not a patchset.
-- **First run is slower.** The cache build runs the summarizer over every undocumented function. Subsequent runs are nearly instant for unchanged files. For a large repo, prewarm the cache before recording a demo.
-- **`get_callers` is heuristic.** It uses AST call-target matching — it'll miss aliased imports (`from auth import login as do_login`) and dynamic dispatch (`getattr(mod, name)()`).
-- **Tool-call rate limits.** Groq's free tier rate-limits multi-turn tool use; very large projects may need pacing or a different provider for the reviewer role.
+- [01-overview.md](docs/01-overview.md) — what + why + who
+- [02-architecture.md](docs/02-architecture.md) — 4-layer diagram + data flow
+- [03-cache-layer.md](docs/03-cache-layer.md) — AST + summarizer + hash invalidation
+- [04-static-analysis.md](docs/04-static-analysis.md) — pylint/bandit/radon wrappers
+- [05-agent-loop.md](docs/05-agent-loop.md) — PydanticAI agent + tool design + prompting
+- [06-output-layer.md](docs/06-output-layer.md) — schema + severity rubric + CLI rendering
+- [07-scope.md](docs/07-scope.md) — what we do and explicitly don't do
+- [08-known-issues.md](docs/08-known-issues.md) — self-audit of this codebase
+- [09-demo-guide.md](docs/09-demo-guide.md) — recording the submission video
+
+---
+
+## Limitations (short version — see [docs/07-scope.md](docs/07-scope.md) and [docs/08-known-issues.md](docs/08-known-issues.md) for full)
+
+- **Python only.** No JS, Go, Rust.
+- **LLM fixes should be reviewed before applying.** The tool suggests; it never patches.
+- **First run is slower.** Subsequent runs reuse the cache for unchanged files.
+- **`get_callers` is heuristic.** Misses aliased imports and dynamic dispatch.
+- **Free-tier rate limits.** Groq caps requests per minute on multi-turn loops.
